@@ -242,17 +242,31 @@ async function readUsage(key) {
   ])
   const plan = subscription?.plan_name || who?.plan_name || undefined
   const vb = budget?.vibe_budget
+  const ab = budget?.api_budget
+  const usd = (x) => Math.round(x * 1e6) / 1e6
   const windows = []
-  if (vb && typeof vb.usage_percentage === "number") {
-    const resetsAt = vb.reset_at ? Date.parse(vb.reset_at) : NaN
+  const windowOf = (name, w, aside) => {
+    if (!w || typeof w.usage_percentage !== "number") return null
+    const initial = typeof w.initial_budget === "number" ? w.initial_budget : 0
+    const resetsAt = w.reset_at ? Date.parse(w.reset_at) : NaN
     const span = Number.isFinite(resetsAt) ? Math.max(3600, Math.floor((resetsAt - Date.now()) / 1000)) : 30 * 86400
-    windows.push({
-      name: "Monthly Vibe Code",
-      used: vb.usage_percentage,
+    const usedUsd = usd(initial * w.usage_percentage / 100)
+    const out = {
+      name,
+      used: w.usage_percentage,
+      amount: usedUsd,
+      limit: initial,
+      unit: "USD",
       resetsAt: Number.isFinite(resetsAt) ? resetsAt : undefined,
       span,
-    })
+    }
+    if (aside) out.aside = true
+    return out
   }
+  const vbm = windowOf("Monthly Vibe Code", vb, false)
+  if (vbm) windows.push(vbm)
+  const abm = windowOf("Platform API credits", ab, true)
+  if (abm) windows.push(abm)
   return { plan, windows, payg: subscription?.vibe_payg_enabled ?? vb?.payg_enabled ?? undefined }
 }
 
@@ -357,6 +371,8 @@ export const MistralVibeAuthPlugin = async ({ client } = {}) => ({
         async fetch(input, init = {}) {
           const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
           headers.set("Authorization", `Bearer ${key}`)
+          // 与官方 CLI 一致的客户端标识（mistral-vibe vibe/utils/http.py: get_user_agent）
+          if (!headers.has("user-agent")) headers.set("user-agent", process.env.MISTRAL_VIBE_UA || "mistral-client-python/Mistral-Vibe/3.1.3")
           const body = mistralBody(init.body)
           if (body !== init.body) {
             // the length the engine counted is not the one sent
