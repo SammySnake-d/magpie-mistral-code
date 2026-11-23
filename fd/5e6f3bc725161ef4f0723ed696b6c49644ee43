@@ -1,0 +1,18 @@
+index.mjs
+  h_f33e46a035b77c 36-38,41-48,94-133,138,142-146,153,155-160,164-215,221,271,332,475,498-501,503,508-509,511-525,528-533,535,541,548-551,576-593
+package.json
+  h_f33e46a035b77c 3
+test/plugin.test.mjs
+  h_f33e46a035b77c 131,428-538
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fd5e6f3bc725161ef4f0723ed696b6c49644ee43",
+  "prompts": {},
+  "humans": {
+    "h_f33e46a035b77c": {
+      "author": "Sammy <caxapokrq+sammy@gmail.com>"
+    }
+  }
+}
