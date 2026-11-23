@@ -128,6 +128,7 @@ function mockFetch() {
 
 afterEach(() => {
   globalThis.fetch = realFetch
+  delete process.env.MISTRAL_VIBE_POLL_MS
 })
 
 const plugin = async () => {
@@ -423,4 +424,115 @@ test("the loader puts an earlier turn's thinking in the typed part", async () =>
     content: [{ type: "thinking", thinking: [{ type: "text", text: "thinking here" }] }, { type: "text", text: "Let me check." }],
   })
   expect(state.bodies[0]).not.toContain("reasoning_content")
+})
+
+test("rateLimitWaitMs handles retry-after 0, numeric seconds, HTTP-date, and exponential cap", () => {
+  const { rateLimitWaitMs } = _internal
+  const r = (val) => (val == null ? new Response("", { status: 429 }) : new Response("", { status: 429, headers: { "retry-after": val } }))
+  // retry-after: 0 falls back to exponential doubling from 2x base
+  expect(rateLimitWaitMs(r("0"), 0, 3000)).toBe(6000)
+  expect(rateLimitWaitMs(r("0"), 6000, 3000)).toBe(12000)
+  expect(rateLimitWaitMs(r("0"), 24000, 3000)).toBe(30000)
+  // positive numeric seconds are respected and capped at 30s
+  expect(rateLimitWaitMs(r("2"), 0, 3000)).toBe(2000)
+  expect(rateLimitWaitMs(r("120"), 0, 3000)).toBe(30000)
+  // HTTP-date Retry-After is parsed into remaining ms and capped
+  const futureDate = new Date(Date.now() + 5000).toUTCString()
+  const wait = rateLimitWaitMs(r(futureDate), 0, 3000)
+  expect(wait).toBeGreaterThan(2000)
+  expect(wait).toBeLessThanOrEqual(6000)
+  // missing header uses exponential doubling
+  expect(rateLimitWaitMs(r(null), 0, 1500)).toBe(3000)
+})
+
+test("sign-in sends official User-Agent and recovers from 429 during both poll and exchange", async () => {
+  process.env.MISTRAL_VIBE_POLL_MS = "10"
+  const seenUAs = []
+  let pollHits = 0
+  let exchangeHits = 0
+  globalThis.fetch = async (input, init = {}) => {
+    const u = new URL(String(input instanceof Request ? input.url : input))
+    const h = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
+    seenUAs.push({ path: u.pathname, ua: h.get("user-agent"), accept: h.get("accept") })
+    const json = (v, status = 200, headers = {}) =>
+      new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json", ...headers } })
+
+    if (u.pathname === "/api/vibe/sign-in") {
+      return json({
+        process_id: "p-429",
+        sign_in_url: "https://console.mistral.ai/codestral/cli/authenticate?process_id=p-429",
+        poll_url: "http://mock.local/api/vibe/sign-in/p-429/poll",
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+      })
+    }
+    if (u.pathname === "/api/vibe/sign-in/p-429/poll") {
+      pollHits++
+      if (pollHits === 1) return json({ detail: "Too Many Requests" }, 429, { "retry-after": "0" })
+      if (pollHits === 2) return json({ status: "pending" })
+      return json({ status: "completed", exchange_token: "et-429" })
+    }
+    if (u.pathname === "/api/vibe/sign-in/p-429/exchange") {
+      exchangeHits++
+      if (exchangeHits <= 2) return json({ detail: "rate limit" }, 429, { "retry-after": "0" })
+      return json({ api_key: KEY })
+    }
+    if (u.pathname === "/api/vibe/whoami") {
+      return json({ plan_name: "Vibe Pro", has_paid_vibe_entitlement: true, customer_id: "cust-429" })
+    }
+    return json({}, 404)
+  }
+
+  const hooks = await plugin()
+  const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
+  const started = await oauth.authorize()
+  const res = await started.callback()
+  expect(res).toEqual({
+    type: "success",
+    key: KEY,
+    metadata: { plan: "Vibe Pro", vibeEntitlement: true },
+    accountId: "cust-429",
+  })
+  expect(pollHits).toBe(3)
+  expect(exchangeHits).toBe(3)
+  for (const req of seenUAs) {
+    expect(req.ua).toBe("mistral-client-python/Mistral-Vibe/3.1.3")
+    expect(req.accept).toBe("application/json")
+  }
+})
+
+test("exchange reports 429 cleanly after max retries and fails immediately on 403 workspace error 9004", async () => {
+  process.env.MISTRAL_VIBE_POLL_MS = "5"
+  let attempts429 = 0
+  globalThis.fetch = async (input) => {
+    const u = new URL(String(input))
+    if (u.pathname.endsWith("/exchange")) {
+      attempts429++
+      return new Response(JSON.stringify({ detail: "Too Many Requests" }), { status: 429, headers: { "retry-after": "0" } })
+    }
+    return new Response("{}", { status: 404 })
+  }
+  await expect(_internal.exchangeSignIn("p-x", "et-x", "cv-x")).rejects.toThrow("Mistral sign-in exchange failed (429: Too Many Requests)")
+  expect(attempts429).toBe(6)
+
+  let attempts9004 = 0
+  globalThis.fetch = async (input) => {
+    const u = new URL(String(input))
+    if (u.pathname.endsWith("/exchange")) {
+      attempts9004++
+      return new Response(JSON.stringify({ error_code: 9004, detail: "forbidden" }), { status: 403 })
+    }
+    return new Response("{}", { status: 404 })
+  }
+  await expect(_internal.exchangeSignIn("p-x", "et-x", "cv-x")).rejects.toThrow("not eligible for Mistral Vibe")
+  expect(attempts9004).toBe(1)
+})
+
+test("abort signal interrupts exchange 429 backoff immediately", async () => {
+  process.env.MISTRAL_VIBE_POLL_MS = "5000"
+  const ac = new AbortController()
+  globalThis.fetch = async () => new Response(JSON.stringify({ detail: "slow down" }), { status: 429, headers: { "retry-after": "30" } })
+  setTimeout(() => ac.abort(new DOMException("Aborted", "AbortError")), 30)
+  const startedAt = Date.now()
+  await expect(_internal.exchangeSignIn("p-a", "et-a", "cv-a", ac.signal)).rejects.toThrow()
+  expect(Date.now() - startedAt).toBeLessThan(1000)
 })
