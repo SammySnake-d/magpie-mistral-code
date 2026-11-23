@@ -445,15 +445,16 @@ test("rateLimitWaitMs handles retry-after 0, numeric seconds, HTTP-date, and exp
   expect(rateLimitWaitMs(r(null), 0, 1500)).toBe(3000)
 })
 
-test("sign-in sends official User-Agent and recovers from 429 during both poll and exchange", async () => {
+test("sign-in sends official User-Agent, closes connections, logs events, and recovers from 429 during poll and exchange", async () => {
   process.env.MISTRAL_VIBE_POLL_MS = "10"
-  const seenUAs = []
+  const seen = []
+  const logs = []
   let pollHits = 0
   let exchangeHits = 0
   globalThis.fetch = async (input, init = {}) => {
     const u = new URL(String(input instanceof Request ? input.url : input))
     const h = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
-    seenUAs.push({ path: u.pathname, ua: h.get("user-agent"), accept: h.get("accept") })
+    seen.push({ path: u.pathname, ua: h.get("user-agent"), accept: h.get("accept"), conn: h.get("connection"), keepalive: init.keepalive })
     const json = (v, status = 200, headers = {}) =>
       new Response(JSON.stringify(v), { status, headers: { "content-type": "application/json", ...headers } })
 
@@ -467,13 +468,13 @@ test("sign-in sends official User-Agent and recovers from 429 during both poll a
     }
     if (u.pathname === "/api/vibe/sign-in/p-429/poll") {
       pollHits++
-      if (pollHits === 1) return json({ detail: "Too Many Requests" }, 429, { "retry-after": "0" })
+      if (pollHits === 1) return json({ message: "Too many requests. Retry later." }, 429, { "retry-after": "0", "cf-ray": "abc-HEL" })
       if (pollHits === 2) return json({ status: "pending" })
       return json({ status: "completed", exchange_token: "et-429" })
     }
     if (u.pathname === "/api/vibe/sign-in/p-429/exchange") {
       exchangeHits++
-      if (exchangeHits <= 2) return json({ detail: "rate limit" }, 429, { "retry-after": "0" })
+      if (exchangeHits <= 2) return json({ detail: "rate limit" }, 429, { "retry-after": "0", "cf-ray": "def-HEL" })
       return json({ api_key: KEY })
     }
     if (u.pathname === "/api/vibe/whoami") {
@@ -482,10 +483,18 @@ test("sign-in sends official User-Agent and recovers from 429 during both poll a
     return json({}, 404)
   }
 
-  const hooks = await plugin()
+  const hooks = await MistralVibeAuthPlugin({
+    client: {
+      auth: { set: async () => {} },
+      app: { log: async (opts) => logs.push(opts?.body?.message ?? "") },
+    },
+  })
   const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
-  const started = await oauth.authorize()
-  const res = await started.callback()
+  const authAc = new AbortController()
+  const started = await oauth.authorize(undefined, { signal: authAc.signal })
+  // simulate magpie cancelling authorize()'s 1-minute context immediately after authorize returns
+  authAc.abort()
+  const res = await started.callback(undefined, { signal: new AbortController().signal })
   expect(res).toEqual({
     type: "success",
     key: KEY,
@@ -494,10 +503,49 @@ test("sign-in sends official User-Agent and recovers from 429 during both poll a
   })
   expect(pollHits).toBe(3)
   expect(exchangeHits).toBe(3)
-  for (const req of seenUAs) {
+  for (const req of seen) {
     expect(req.ua).toBe("mistral-client-python/Mistral-Vibe/3.1.3")
     expect(req.accept).toBe("application/json")
+    expect(req.conn).toBe("close")
+    expect(req.keepalive).toBe(false)
   }
+  expect(logs.some((m) => m.includes("sign-in poll 429"))).toBe(true)
+  expect(logs.some((m) => m.includes("sign-in exchange 429"))).toBe(true)
+  expect(logs.some((m) => m.includes("sign-in succeeded"))).toBe(true)
+})
+
+test("poll stops with clear error after repeated consecutive 429s", async () => {
+  process.env.MISTRAL_VIBE_POLL_MS = "5"
+  let pollHits = 0
+  globalThis.fetch = async (input) => {
+    const u = new URL(String(input))
+    if (u.pathname === "/api/vibe/sign-in") {
+      return new Response(
+        JSON.stringify({
+          process_id: "p-limit",
+          sign_in_url: "https://console.mistral.ai/codestral/cli/authenticate?process_id=p-limit",
+          poll_url: "http://mock.local/api/vibe/sign-in/p-limit/poll",
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      )
+    }
+    if (u.pathname.endsWith("/poll")) {
+      pollHits++
+      return new Response(JSON.stringify({ message: "Too many requests. Retry later." }), {
+        status: 429,
+        headers: { "content-type": "application/json", "retry-after": "0" },
+      })
+    }
+    return new Response("{}", { status: 404 })
+  }
+  const hooks = await plugin()
+  const oauth = hooks.auth.methods.find((m) => m.type === "oauth")
+  const started = await oauth.authorize()
+  const res = await started.callback()
+  expect(pollHits).toBe(6)
+  expect(res.type).toBe("failed")
+  expect(res.error).toContain("Sign-in poll rate-limited (429")
 })
 
 test("exchange reports 429 cleanly after max retries and fails immediately on 403 workspace error 9004", async () => {
