@@ -427,12 +427,26 @@ function thinkingText(m) {
   return out
 }
 
-// asMistralMessage puts one message's thinking where Mistral takes it and
-// says whether it changed anything. A message with no thinking of its own
-// keeps its bytes. A prefill (prefix) keeps its content as it is: its text
-// is what goes on, so the thinking is only dropped there.
+// MISTRAL_MESSAGE_FIELDS are the fields Mistral takes on a chat message; the
+// rest it turns away, the same extra_forbidden way (#1: WorkBuddy 5.11.3 puts
+// startsNewUserRequest / agent / conversationRequestId on every message it
+// sends, so loc ["body","messages",1,"user","startsNewUserRequest"]).
+const MISTRAL_MESSAGE_FIELDS = new Set(["role", "content", "name", "prefix", "tool_calls", "tool_call_id"])
+
+// asMistralMessage puts one message's thinking where Mistral takes it, drops
+// the fields Mistral doesn't take, and says whether it changed anything. A
+// message with nothing to move keeps its bytes. A prefill (prefix) keeps its
+// content as it is: its text is what goes on, so the thinking is only
+// dropped there.
 function asMistralMessage(m) {
-  if (!THINKING_FIELDS.some((f) => f in m)) return false
+  let changed = false
+  for (const f of Object.keys(m)) {
+    if (!MISTRAL_MESSAGE_FIELDS.has(f) && !THINKING_FIELDS.includes(f)) {
+      delete m[f]
+      changed = true
+    }
+  }
+  if (!THINKING_FIELDS.some((f) => f in m)) return changed
   const think = thinkingText(m)
   for (const f of THINKING_FIELDS) delete m[f]
   if (think === "" || m.role !== "assistant" || m.prefix === true) return true
@@ -445,11 +459,11 @@ function asMistralMessage(m) {
 }
 
 // mistralBody is a chat request's body with every message's thinking in the
-// shape Mistral takes, and without the fields it turns away. A body with no
-// such field comes back as it was, byte for byte, and so does one that isn't
-// a chat request's JSON.
+// shape Mistral takes, and without the fields it turns away. A body with
+// nothing to move comes back as it was, byte for byte, and so does one that
+// isn't a chat request's JSON.
 function mistralBody(body) {
-  if (typeof body !== "string" || !body.includes("reasoning")) return body
+  if (typeof body !== "string") return body
   let q
   try {
     q = JSON.parse(body)

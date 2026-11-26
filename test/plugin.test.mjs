@@ -382,6 +382,33 @@ test("an earlier turn's thinking goes in the typed part Mistral takes", () => {
   expect(o.messages[2]).toEqual({ role: "assistant", content: "cut" })
 })
 
+// WorkBuddy puts startsNewUserRequest / agent / conversationRequestId on every
+// message it sends (5.11.3), and Mistral refuses those the same extra_forbidden
+// way (#1). They go — and the body need not mention reasoning at all for that
+// to happen.
+test("a client's own message fields are dropped, reasoning or not", () => {
+  const { mistralBody } = _internal
+  const body = JSON.stringify({
+    model: "deepseek-v4-1-flash-1017",
+    messages: [
+      { role: "system", content: "s" },
+      { role: "user", content: "你好", startsNewUserRequest: true, agent: "cli", conversationRequestId: "01a20ce535ae734d82e6c321b3b0de51" },
+    ],
+    reasoning_effort: "high",
+  })
+  expect(mistralRefuse(body)).toBeTruthy()
+  expect(mistralRefuse(mistralBody(body))).toBeNull()
+  const out = JSON.parse(mistralBody(body))
+  expect(out.messages[0]).toEqual({ role: "system", content: "s" })
+  expect(out.messages[1]).toEqual({ role: "user", content: "你好" })
+
+  // nothing here says "reasoning": the fields still go
+  const quiet = JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi", agent: "cli" }], max_tokens: 1 })
+  expect(JSON.parse(mistralBody(quiet)).messages[0]).toEqual({ role: "user", content: "hi" })
+  // …while the rest of the request keeps its shape
+  expect(JSON.parse(mistralBody(quiet)).max_tokens).toBe(1)
+})
+
 // a body with no thinking, or not a chat request's JSON, comes back byte for
 // byte: every other request keeps its bytes on the way
 test("a body with nothing to move comes back untouched", () => {
