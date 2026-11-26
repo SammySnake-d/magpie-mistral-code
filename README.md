@@ -88,6 +88,8 @@ magpie quota mistral-vibe --json
 
 agent 回传历史时会带 `reasoning_content` / `reasoning` / `reasoning_details`，而 Mistral 对未知字段返回 `422 Extra inputs are not permitted`。插件把这些思考内容改写成 Mistral 的 typed content part（thinking 块）放到该轮文本之前，因此带思考轮的会话不会中断。
 
+除思考字段外，message 上的其它未知字段也会被丢掉（按 `role` / `content` / `name` / `prefix` / `tool_calls` / `tool_call_id` 白名单保留）。例如 WorkBuddy 5.11.3 会在每条 message 上带 `startsNewUserRequest`、`agent`、`conversationRequestId`，正是这类字段触发 422（[#1](https://github.com/SammySnake-d/magpie-mistral-code/issues/1)）。
+
 出站请求的 `User-Agent` 与官方客户端一致：`mistral-client-python/Mistral-Vibe/3.1.3`（对应 Vibe Desktop 1.2.0 内置的 `mistral_vibe-3.1.3`）。
 
 ## 排错
